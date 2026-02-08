@@ -1221,15 +1221,34 @@ impl<'a> ResourceTracker<'a> {
     }
 }
 
-/// Read the contents of an AVIF file with custom parsing options
+/// Read the contents of an AVIF file with resource limits and cancellation support
 ///
-/// Metadata is accumulated and returned in [`AvifData`] struct.
+/// This is the primary parsing function with full control over resource limits
+/// and cooperative cancellation via the `Stop` trait.
 ///
 /// # Arguments
 ///
 /// * `f` - Reader for the AVIF file
-/// * `options` - Parsing options (e.g., lenient mode)
-pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Result<AvifData> {
+/// * `config` - Resource limits and parsing options
+/// * `stop` - Cancellation token (use `enough::Unstoppable` if not needed)
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use avif_parse::{read_avif_with_config, DecodeConfig};
+/// use std::fs::File;
+///
+/// let mut file = File::open("image.avif")?;
+/// let config = DecodeConfig::default();
+/// let data = read_avif_with_config(&mut file, &config, enough::Unstoppable)?;
+/// # Ok::<(), avif_parse::Error>(())
+/// ```
+pub fn read_avif_with_config<T: Read>(
+    f: &mut T,
+    config: &DecodeConfig,
+    stop: impl enough::Stop,
+) -> Result<AvifData> {
+    let mut tracker = ResourceTracker::new(config);
     let mut f = OffsetReader::new(f);
 
     let mut iter = BoxIter::new(&mut f);
@@ -1254,12 +1273,15 @@ pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Res
     let mut animation_data: Option<(u32, SampleTable)> = None;
 
     while let Some(mut b) = iter.next_box()? {
+        stop.check()?;
+
         match b.head.name {
             BoxType::MetadataBox => {
                 if meta.is_some() {
                     return Err(Error::InvalidData("There should be zero or one meta boxes per ISO 14496-12:2015 § 8.11.1.1"));
                 }
-                meta = Some(read_avif_meta(&mut b, options)?);
+                let parse_opts = ParseOptions { lenient: config.lenient };
+                meta = Some(read_avif_meta(&mut b, &parse_opts)?);
             },
             BoxType::MovieBox => {
                 animation_data = read_moov(&mut b)?;
@@ -1267,7 +1289,18 @@ pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Res
             BoxType::MediaDataBox => {
                 if b.bytes_left() > 0 {
                     let offset = b.offset();
+                    let size = b.bytes_left() as u64;
+
+                    // Validate mdat size before reading
+                    const MAX_MDAT_SIZE: u64 = 500_000_000; // 500MB per mdat
+                    if size > MAX_MDAT_SIZE {
+                        return Err(Error::InvalidData("mdat too large"));
+                    }
+
+                    tracker.reserve(size)?;
                     let data = b.read_into_try_vec()?;
+                    tracker.release(size);
+
                     mdats.push(MediaDataBox { offset, data })?;
                 }
             },
@@ -1322,6 +1355,9 @@ pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Res
             }
         }
 
+        // Validate tile count
+        tracker.validate_grid_tiles(tiles_with_index.len() as u32)?;
+
         // Sort tiles by reference_index to get correct grid order
         tiles_with_index.sort_by_key(|&(_, idx)| idx);
 
@@ -1353,6 +1389,9 @@ pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Res
             });
 
             if let (Some(grid), Some(tile)) = (grid_dims, tile_dims) {
+                // Validate grid output dimensions
+                tracker.validate_total_megapixels(grid.width, grid.height)?;
+
                 // Validate tile dimensions are non-zero (already validated in read_ispe, but defensive)
                 if tile.width == 0 || tile.height == 0 {
                     log::warn!("Grid: tile has zero dimensions, using fallback");
@@ -1486,7 +1525,11 @@ pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Res
     // For grid images, we need to load tiles in the order specified by iref
     if is_grid {
         // Extract each tile in order
-        for &tile_id in tile_item_ids.iter() {
+        for (idx, &tile_id) in tile_item_ids.iter().enumerate() {
+            if idx % 16 == 0 {
+                stop.check()?;
+            }
+
             let mut tile_data = TryVec::new();
 
             if let Some(loc) = meta.iloc_items.iter().find(|loc| loc.item_id == tile_id) {
@@ -1517,6 +1560,10 @@ pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Res
 
     // Extract animation frames if this is an animated AVIF
     if let Some((media_timescale, sample_table)) = animation_data {
+        // Validate frame count
+        let frame_count = sample_table.sample_to_chunk.len() as u32;
+        tracker.validate_animation_frames(frame_count)?;
+
         log::debug!("Animation: extracting frames (media_timescale={})", media_timescale);
         match extract_animation_frames(&sample_table, media_timescale, &mut mdats) {
             Ok(frames) => {
@@ -1535,6 +1582,19 @@ pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Res
     }
 
     Ok(context)
+}
+
+/// Read the contents of an AVIF file with custom parsing options
+///
+/// Metadata is accumulated and returned in [`AvifData`] struct.
+///
+/// # Arguments
+///
+/// * `f` - Reader for the AVIF file
+/// * `options` - Parsing options (e.g., lenient mode)
+pub fn read_avif_with_options<T: Read>(f: &mut T, options: &ParseOptions) -> Result<AvifData> {
+    let config = DecodeConfig::unlimited().lenient(options.lenient);
+    read_avif_with_config(f, &config, enough::Unstoppable)
 }
 
 /// Read the contents of an AVIF file
