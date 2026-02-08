@@ -1560,8 +1560,8 @@ pub fn read_avif_with_config<T: Read>(
 
     // Extract animation frames if this is an animated AVIF
     if let Some((media_timescale, sample_table)) = animation_data {
-        // Validate frame count
-        let frame_count = sample_table.sample_to_chunk.len() as u32;
+        // Validate frame count (sample_sizes contains one entry per frame)
+        let frame_count = sample_table.sample_sizes.len() as u32;
         tracker.validate_animation_frames(frame_count)?;
 
         log::debug!("Animation: extracting frames (media_timescale={})", media_timescale);
