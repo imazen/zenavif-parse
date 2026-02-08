@@ -142,16 +142,21 @@ pub enum Error {
     NoMoov,
     /// Out of memory
     OutOfMemory,
+    /// Resource limit exceeded during parsing
+    ResourceLimitExceeded(&'static str),
+    /// Operation was stopped/cancelled
+    Stopped(enough::StopReason),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
-            Self::InvalidData(s) | Self::Unsupported(s) => s,
+            Self::InvalidData(s) | Self::Unsupported(s) | Self::ResourceLimitExceeded(s) => s,
             Self::UnexpectedEOF => "EOF",
             Self::Io(err) => return err.fmt(f),
             Self::NoMoov => "Missing Moov box",
             Self::OutOfMemory => "OOM",
+            Self::Stopped(reason) => return write!(f, "Stopped: {}", reason),
         };
         f.write_str(msg)
     }
@@ -205,6 +210,12 @@ impl From<Error> for std::io::Error {
 impl From<TryReserveError> for Error {
     fn from(_: TryReserveError) -> Self {
         Self::OutOfMemory
+    }
+}
+
+impl From<enough::StopReason> for Error {
+    fn from(reason: enough::StopReason) -> Self {
+        Self::Stopped(reason)
     }
 }
 
