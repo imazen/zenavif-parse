@@ -25,6 +25,69 @@ if data.premultiplied_alpha {
 }
 ```
 
+### Resource Limits and Defensive Parsing
+
+For untrusted input, use `read_avif_with_config()` to enforce resource limits:
+
+```rust
+use avif_parse::{read_avif_with_config, DecodeConfig};
+
+// Conservative limits for untrusted files
+let config = DecodeConfig::default()
+    .with_peak_memory_limit(100_000_000)  // 100MB max
+    .with_total_megapixels_limit(64)       // 64MP max
+    .with_max_animation_frames(100);       // 100 frames max
+
+let data = read_avif_with_config(&mut file, &config, enough::Unstoppable)?;
+```
+
+**Default limits** (applied with `DecodeConfig::default()`):
+- Peak memory: 1GB
+- Total megapixels: 512MP
+- Frame megapixels: 256MP
+- Max animation frames: 10,000
+- Max grid tiles: 1,000
+
+**Unlimited parsing** (backwards compatible):
+```rust
+let config = DecodeConfig::unlimited();
+let data = read_avif_with_config(&mut file, &config, enough::Unstoppable)?;
+```
+
+### Cooperative Cancellation
+
+Long-running parsing can be cancelled using the `Stop` trait:
+
+```rust
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct Canceller {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl enough::Stop for Canceller {
+    fn check(&self) -> Result<(), enough::StopReason> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Err(enough::StopReason::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+let cancelled = Arc::new(AtomicBool::new(false));
+let stop = Canceller { cancelled: cancelled.clone() };
+
+// In another thread: cancelled.store(true, Ordering::Relaxed);
+
+match read_avif_with_config(&mut file, &config, stop) {
+    Ok(data) => { /* completed */ },
+    Err(Error::Stopped(_)) => { /* cancelled */ },
+    Err(e) => { /* error */ },
+}
+```
+
 ## Usage from C
 
 Install Rust 1.68 or later, preferably via [rustup](https://rustup.rs), and run:
