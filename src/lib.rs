@@ -1082,6 +1082,145 @@ fn skip_box_remain<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<()> {
     skip(src, remain)
 }
 
+/// Internal resource tracker for defensive parsing
+///
+/// Tracks memory allocations and validates resource limits before allocations occur.
+/// This prevents out-of-memory conditions from malicious files claiming unrealistic counts.
+struct ResourceTracker<'a> {
+    config: &'a DecodeConfig,
+    current_memory: u64,
+    peak_memory: u64,
+}
+
+impl<'a> ResourceTracker<'a> {
+    fn new(config: &'a DecodeConfig) -> Self {
+        Self {
+            config,
+            current_memory: 0,
+            peak_memory: 0,
+        }
+    }
+
+    /// Reserve memory and check against peak limit
+    fn reserve(&mut self, bytes: u64) -> Result<()> {
+        self.current_memory = self.current_memory.saturating_add(bytes);
+        self.peak_memory = self.peak_memory.max(self.current_memory);
+
+        if let Some(limit) = self.config.peak_memory_limit {
+            if self.peak_memory > limit {
+                return Err(Error::ResourceLimitExceeded("peak memory limit exceeded"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Release memory from tracking
+    fn release(&mut self, bytes: u64) {
+        self.current_memory = self.current_memory.saturating_sub(bytes);
+    }
+
+    /// Validate collection size before allocation
+    ///
+    /// Checks that the count is reasonable and won't exceed memory limits
+    fn validate_collection_size<T>(&mut self, count: u64) -> Result<()> {
+        // Reject unrealistic counts
+        const MAX_ITEMS: u64 = 100_000_000;
+        if count > MAX_ITEMS {
+            return Err(Error::InvalidData("unrealistic item count"));
+        }
+
+        // Check memory requirements
+        let item_size = std::mem::size_of::<T>() as u64;
+        let bytes = count.checked_mul(item_size)
+            .ok_or(Error::InvalidData("item count overflow"))?;
+
+        self.reserve(bytes)?;
+
+        Ok(())
+    }
+
+    /// Validate total megapixels for grid images
+    fn validate_total_megapixels(&self, width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidData("zero dimension"));
+        }
+
+        // Reject unrealistic dimensions (>1M pixels per side)
+        const MAX_DIMENSION: u32 = 1_000_000;
+        if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(Error::InvalidData("dimension exceeds maximum"));
+        }
+
+        if let Some(limit) = self.config.total_megapixels_limit {
+            let megapixels = (width as u64)
+                .checked_mul(height as u64)
+                .ok_or(Error::InvalidData("dimension overflow"))?
+                / 1_000_000;
+
+            if megapixels > limit as u64 {
+                return Err(Error::ResourceLimitExceeded("total megapixels limit exceeded"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate per-frame/per-tile megapixels
+    fn validate_frame_megapixels(&self, width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidData("zero dimension"));
+        }
+
+        // Reject unrealistic dimensions
+        const MAX_DIMENSION: u32 = 1_000_000;
+        if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(Error::InvalidData("dimension exceeds maximum"));
+        }
+
+        if let Some(limit) = self.config.frame_megapixels_limit {
+            let megapixels = (width as u64)
+                .checked_mul(height as u64)
+                .ok_or(Error::InvalidData("dimension overflow"))?
+                / 1_000_000;
+
+            if megapixels > limit as u64 {
+                return Err(Error::ResourceLimitExceeded("frame megapixels limit exceeded"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate animation frame count
+    fn validate_animation_frames(&self, count: u32) -> Result<()> {
+        // Reject clearly unrealistic counts
+        const ABSOLUTE_MAX: u32 = 10_000_000;
+        if count > ABSOLUTE_MAX {
+            return Err(Error::InvalidData("unrealistic frame count"));
+        }
+
+        if let Some(limit) = self.config.max_animation_frames {
+            if count > limit {
+                return Err(Error::ResourceLimitExceeded("animation frame count limit exceeded"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate grid tile count
+    fn validate_grid_tiles(&self, count: u32) -> Result<()> {
+        if let Some(limit) = self.config.max_grid_tiles {
+            if count > limit {
+                return Err(Error::ResourceLimitExceeded("grid tile count limit exceeded"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Read the contents of an AVIF file with custom parsing options
 ///
 /// Metadata is accumulated and returned in [`AvifData`] struct.
