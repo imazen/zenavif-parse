@@ -296,6 +296,183 @@ pub struct ParseOptions {
     pub lenient: bool,
 }
 
+/// Configuration for parsing AVIF files with resource limits and validation options
+///
+/// `DecodeConfig` provides fine-grained control over resource consumption during
+/// AVIF parsing, allowing defensive parsing against malicious or malformed files.
+///
+/// # Resource Limits
+///
+/// Resource limits are checked **before** allocations occur, preventing out-of-memory
+/// conditions from malicious files that claim unrealistic dimensions or counts:
+///
+/// - **Peak memory**: Maximum heap allocation during parsing
+/// - **Megapixels**: Maximum image dimensions (total and per-frame)
+/// - **Counts**: Maximum animation frames and grid tiles
+///
+/// # Examples
+///
+/// ## Conservative Parsing (default)
+///
+/// Default limits are suitable for most applications:
+///
+/// ```rust
+/// use avif_parse::DecodeConfig;
+///
+/// let config = DecodeConfig::default();
+/// // 1GB peak memory, 512MP total, 256MP per frame
+/// // 10,000 max frames, 1,000 max tiles
+/// ```
+///
+/// ## Strict Limits for Untrusted Input
+///
+/// ```rust
+/// use avif_parse::DecodeConfig;
+///
+/// let config = DecodeConfig::default()
+///     .with_peak_memory_limit(100_000_000)  // 100MB
+///     .with_total_megapixels_limit(64)       // 64MP max
+///     .with_frame_megapixels_limit(32)       // 32MP per frame
+///     .with_max_animation_frames(100)        // 100 frames
+///     .with_max_grid_tiles(64);              // 8×8 grid max
+/// ```
+///
+/// ## Unlimited Parsing (backwards compatibility)
+///
+/// ```rust
+/// use avif_parse::DecodeConfig;
+///
+/// let config = DecodeConfig::unlimited();
+/// // No resource limits, only allocation failures enforced
+/// ```
+///
+/// ## Custom Configuration
+///
+/// ```rust
+/// use avif_parse::DecodeConfig;
+///
+/// let config = DecodeConfig {
+///     peak_memory_limit: Some(500_000_000),  // 500MB
+///     total_megapixels_limit: Some(256),      // 256MP
+///     frame_megapixels_limit: Some(128),      // 128MP per frame
+///     max_animation_frames: Some(1000),       // 1000 frames
+///     max_grid_tiles: Some(256),              // 16×16 grid max
+///     lenient: false,
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct DecodeConfig {
+    /// Maximum peak heap memory usage in bytes
+    ///
+    /// Parsing will fail if peak memory exceeds this limit.
+    /// Default: 1GB (1,000,000,000 bytes)
+    pub peak_memory_limit: Option<u64>,
+
+    /// Maximum total megapixels for grid images
+    ///
+    /// Grid images are validated against this limit using their full output dimensions.
+    /// Default: 512 megapixels
+    pub total_megapixels_limit: Option<u32>,
+
+    /// Maximum megapixels per frame/tile
+    ///
+    /// Individual frames and grid tiles are validated against this limit.
+    /// Default: 256 megapixels
+    pub frame_megapixels_limit: Option<u32>,
+
+    /// Maximum number of animation frames
+    ///
+    /// Parsing will fail if the file claims more than this many frames.
+    /// Default: 10,000 frames
+    pub max_animation_frames: Option<u32>,
+
+    /// Maximum number of grid tiles
+    ///
+    /// Parsing will fail if the file claims more than this many tiles.
+    /// Default: 1,000 tiles
+    pub max_grid_tiles: Option<u32>,
+
+    /// Enable lenient parsing mode
+    ///
+    /// When true, non-critical validation errors will be ignored.
+    /// Default: false (strict validation)
+    pub lenient: bool,
+}
+
+impl Default for DecodeConfig {
+    fn default() -> Self {
+        Self {
+            peak_memory_limit: Some(1_000_000_000),  // 1GB
+            total_megapixels_limit: Some(512),        // 512MP
+            frame_megapixels_limit: Some(256),        // 256MP
+            max_animation_frames: Some(10_000),       // 10k frames
+            max_grid_tiles: Some(1_000),              // 1k tiles
+            lenient: false,
+        }
+    }
+}
+
+impl DecodeConfig {
+    /// Create a configuration with no resource limits
+    ///
+    /// This is equivalent to the behavior of `read_avif()` before resource
+    /// limits were added. Only allocation failures will prevent parsing.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use avif_parse::DecodeConfig;
+    ///
+    /// let config = DecodeConfig::unlimited();
+    /// ```
+    pub fn unlimited() -> Self {
+        Self {
+            peak_memory_limit: None,
+            total_megapixels_limit: None,
+            frame_megapixels_limit: None,
+            max_animation_frames: None,
+            max_grid_tiles: None,
+            lenient: false,
+        }
+    }
+
+    /// Set the peak memory limit in bytes
+    pub fn with_peak_memory_limit(mut self, bytes: u64) -> Self {
+        self.peak_memory_limit = Some(bytes);
+        self
+    }
+
+    /// Set the total megapixels limit for grid images
+    pub fn with_total_megapixels_limit(mut self, megapixels: u32) -> Self {
+        self.total_megapixels_limit = Some(megapixels);
+        self
+    }
+
+    /// Set the per-frame/per-tile megapixels limit
+    pub fn with_frame_megapixels_limit(mut self, megapixels: u32) -> Self {
+        self.frame_megapixels_limit = Some(megapixels);
+        self
+    }
+
+    /// Set the maximum animation frame count
+    pub fn with_max_animation_frames(mut self, frames: u32) -> Self {
+        self.max_animation_frames = Some(frames);
+        self
+    }
+
+    /// Set the maximum grid tile count
+    pub fn with_max_grid_tiles(mut self, tiles: u32) -> Self {
+        self.max_grid_tiles = Some(tiles);
+        self
+    }
+
+    /// Enable lenient parsing mode
+    pub fn lenient(mut self, lenient: bool) -> Self {
+        self.lenient = lenient;
+        self
+    }
+}
+
 /// Grid configuration for tiled/grid-based AVIF images
 #[derive(Debug, Clone, PartialEq)]
 /// Grid image configuration
