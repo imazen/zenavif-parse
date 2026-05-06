@@ -1747,6 +1747,11 @@ impl<'data> AvifParser<'data> {
 
             let grid_config = Self::calculate_grid_config(&meta, &tile_ids)?;
 
+            // Enforce total_megapixels_limit on grid output dimensions on the
+            // default zero-copy path (the eager path also calls this at
+            // calculate_grid_config sites). H1 of the 2026-05-06 audit.
+            tracker.validate_total_megapixels(grid_config.output_width, grid_config.output_height)?;
+
             // AVIF 1.2: transformative properties SHALL NOT be on grid tile items
             for (tile_id, _) in tiles_with_index.iter() {
                 for prop in meta.properties.iter() {
@@ -1765,6 +1770,21 @@ impl<'data> AvifParser<'data> {
 
             (Some(grid_config), tile_extents)
         } else {
+            // Non-grid primary: enforce total_megapixels_limit on the primary
+            // item's ispe dimensions if present. H1 of 2026-05-06 audit.
+            let primary_dims = meta.properties.iter().find_map(|p| {
+                if p.item_id == meta.primary_item_id {
+                    match &p.property {
+                        ItemProperty::ImageSpatialExtents(e) => Some((e.width, e.height)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
+            if let Some((w, h)) = primary_dims {
+                tracker.validate_total_megapixels(w, h)?;
+            }
             (None, TryVec::new())
         };
 
@@ -3087,7 +3107,6 @@ impl<'a> ResourceTracker<'a> {
         self.current_memory = self.current_memory.saturating_sub(bytes);
     }
 
-    #[cfg(feature = "eager")]
     fn validate_total_megapixels(&self, width: u32, height: u32) -> Result<()> {
         if let Some(limit) = self.config.total_megapixels_limit {
             let megapixels = (width as u64)
