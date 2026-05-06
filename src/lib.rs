@@ -5081,6 +5081,30 @@ mod sample_offset_overflow_tests {
         }
     }
 
+    /// Audit H3: same overflow class in eager `extract_animation_frames`'s
+    /// `sample_offset + sample_size as u64`. We only verify the arithmetic
+    /// behaviour here; the call site is now `checked_add` and exercises the
+    /// same Error::InvalidData path.
+    #[cfg(feature = "eager")]
+    #[test]
+    fn extract_animation_frames_rejects_offset_size_overflow() {
+        let mut sample_offsets = TryVec::new();
+        sample_offsets.push(u64::MAX - 5).unwrap();
+        let mut sample_sizes = TryVec::new();
+        sample_sizes.push(10u32).unwrap(); // MAX-5 + 10 wraps
+        let sample_table = SampleTable {
+            time_to_sample: TryVec::new(),
+            sample_sizes,
+            sample_offsets,
+        };
+        let mut mdats: [MediaDataBox; 0] = [];
+        let result = extract_animation_frames(&sample_table, 1, &mut mdats[..]);
+        match result {
+            Err(Error::InvalidData(msg)) => assert_eq!(msg, "sample offset overflow"),
+            other => panic!("expected InvalidData(sample offset overflow), got {:?}", other),
+        }
+    }
+
     /// Sanity: a non-malicious table still computes offsets correctly.
     #[test]
     fn benign_offsets_compute_correctly() {
@@ -5411,10 +5435,14 @@ fn extract_animation_frames(
         let mut frame_data = TryVec::new();
         let mut found = false;
 
+        let end = sample_offset
+            .checked_add(sample_size as u64)
+            .ok_or(Error::InvalidData("sample offset overflow"))?;
+
         for mdat in mdats.iter_mut() {
             let range = ExtentRange::WithLength(Range {
                 start: sample_offset,
-                end: sample_offset + sample_size as u64,
+                end,
             });
 
             if mdat.contains_extent(&range) {
