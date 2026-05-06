@@ -4992,6 +4992,26 @@ fn read_stbl<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<(SampleTable, TrackCod
 
     // Precompute per-sample byte offsets from sample_to_chunk + chunk_offsets + sample_sizes.
     // This flattens the ISOBMFF indirection into a simple array for O(1) frame lookup.
+    let sample_offsets = precompute_sample_offsets(&sample_to_chunk, &chunk_offsets, &sample_sizes)?;
+
+    Ok((SampleTable {
+        time_to_sample,
+        sample_sizes,
+        sample_offsets,
+    }, codec_config))
+}
+
+/// Flatten sample_to_chunk + chunk_offsets + sample_sizes into per-sample byte offsets.
+///
+/// Returns `Err(Error::InvalidData)` on offset overflow — a malicious or malformed
+/// `co64` chunk_offset close to `u64::MAX` combined with a non-zero sample_size
+/// would otherwise wrap and reposition AV1 frame starts at attacker-chosen offsets.
+/// (Audit H2, 2026-05-06.)
+fn precompute_sample_offsets(
+    sample_to_chunk: &TryVec<SampleToChunkEntry>,
+    chunk_offsets: &TryVec<u64>,
+    sample_sizes: &TryVec<u32>,
+) -> Result<TryVec<u64>> {
     let mut sample_offsets = TryVec::new();
     let mut sample_idx = 0usize;
     for (i, entry) in sample_to_chunk.iter().enumerate() {
@@ -5016,18 +5036,69 @@ fn read_stbl<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<(SampleTable, TrackCod
                     break;
                 }
                 sample_offsets.push(offset)?;
-                offset += *sample_sizes.get(sample_idx)
-                    .ok_or(Error::InvalidData("sample index mismatch"))? as u64;
+                let sample_size = *sample_sizes.get(sample_idx)
+                    .ok_or(Error::InvalidData("sample index mismatch"))?;
+                offset = offset.checked_add(sample_size as u64)
+                    .ok_or(Error::InvalidData("sample offset overflow"))?;
                 sample_idx += 1;
             }
         }
     }
+    Ok(sample_offsets)
+}
 
-    Ok((SampleTable {
-        time_to_sample,
-        sample_sizes,
-        sample_offsets,
-    }, codec_config))
+#[cfg(test)]
+mod sample_offset_overflow_tests {
+    use super::*;
+
+    fn s2c(first_chunk: u32, samples_per_chunk: u32) -> SampleToChunkEntry {
+        SampleToChunkEntry {
+            first_chunk,
+            samples_per_chunk,
+            _sample_description_index: 1,
+        }
+    }
+
+    /// Audit H2: a co64 chunk offset near u64::MAX combined with a non-zero
+    /// sample size used to wrap, repositioning subsequent samples at attacker-
+    /// chosen low offsets. We now reject with InvalidData.
+    #[test]
+    fn malicious_co64_offset_plus_size_overflow_is_rejected() {
+        let mut s2c_v = TryVec::new();
+        s2c_v.push(s2c(1, 2)).unwrap(); // 1 chunk, 2 samples per chunk
+        let mut chunk_offsets = TryVec::new();
+        chunk_offsets.push(u64::MAX - 5).unwrap(); // co64 near top
+        let mut sample_sizes = TryVec::new();
+        sample_sizes.push(10u32).unwrap(); // first sample @ MAX-5, MAX-5+10 wraps
+        sample_sizes.push(1u32).unwrap();
+
+        let result = precompute_sample_offsets(&s2c_v, &chunk_offsets, &sample_sizes);
+        match result {
+            Err(Error::InvalidData(msg)) => {
+                assert_eq!(msg, "sample offset overflow");
+            }
+            other => panic!("expected InvalidData(sample offset overflow), got {:?}", other),
+        }
+    }
+
+    /// Sanity: a non-malicious table still computes offsets correctly.
+    #[test]
+    fn benign_offsets_compute_correctly() {
+        let mut s2c_v = TryVec::new();
+        s2c_v.push(s2c(1, 3)).unwrap();
+        let mut chunk_offsets = TryVec::new();
+        chunk_offsets.push(1000u64).unwrap();
+        let mut sample_sizes = TryVec::new();
+        sample_sizes.push(10u32).unwrap();
+        sample_sizes.push(20u32).unwrap();
+        sample_sizes.push(30u32).unwrap();
+
+        let offsets = precompute_sample_offsets(&s2c_v, &chunk_offsets, &sample_sizes).unwrap();
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(*offsets.get(0).unwrap(), 1000);
+        assert_eq!(*offsets.get(1).unwrap(), 1010);
+        assert_eq!(*offsets.get(2).unwrap(), 1030);
+    }
 }
 
 /// Parse Track Header box (tkhd)
