@@ -1342,6 +1342,17 @@ pub struct AvifParser<'data> {
     gain_map_metadata: Option<GainMapMetadata>,
     gain_map: Option<ItemExtents>,
     gain_map_color_info: Option<ColorInformation>,
+    /// Gain-MLP (Canham et al. 2025) bake bytes — an auxiliary item
+    /// (type `'zmlp'`) linked from the `tmap` derived-image item via
+    /// an `'auxl'` iref. Carries a ZNPR v3 MLP that
+    /// `zentone::GainMapMlpDecoder` consumes to reconstruct HDR per
+    /// pixel.
+    ///
+    /// **Experimental.** The `'zmlp'` item type is vendor-prefixed
+    /// and not part of any ratified spec. See
+    /// `zenavif-serialize::set_gain_map_mlp_bake` for the encoder
+    /// side.
+    gain_map_mlp_bake: Option<ItemExtents>,
     depth_item: Option<ItemExtents>,
     depth_width: u32,
     depth_height: u32,
@@ -1580,6 +1591,7 @@ impl<'data> AvifParser<'data> {
                 exif_item: None,
                 xmp_item: None,
                 gain_map_metadata: None,
+                gain_map_mlp_bake: None,
                 gain_map: None,
                 gain_map_color_info: None,
                 depth_item: None,
@@ -1768,8 +1780,9 @@ impl<'data> AvifParser<'data> {
             (None, TryVec::new())
         };
 
-        // Detect gain map (tmap derived image item)
-        let (gain_map_metadata, gain_map, gain_map_color_info) = {
+        // Detect gain map (tmap derived image item) + any
+        // experimental 'zmlp' Gain-MLP bake linked via 'auxl' iref.
+        let (gain_map_metadata, gain_map, gain_map_color_info, gain_map_mlp_bake) = {
             let tmap_item = meta.item_infos.iter()
                 .find(|info| info.item_type == b"tmap");
 
@@ -1784,6 +1797,24 @@ impl<'data> AvifParser<'data> {
                     }
                 }
                 inputs.sort_by_key(|&(_, idx)| idx);
+
+                // Find auxl references FROM tmap that point at 'zmlp'
+                // items (Gain-MLP bake bytes). Multiple bakes are
+                // unsupported — we take the first one and ignore
+                // duplicates rather than fail the parse.
+                let mut zmlp_extents: Option<ItemExtents> = None;
+                for iref in meta.item_references.iter() {
+                    if iref.from_item_id != tmap_id || iref.item_type != b"auxl" {
+                        continue;
+                    }
+                    let target_id = iref.to_item_id;
+                    let is_zmlp = meta.item_infos.iter().any(|info| {
+                        info.item_id == target_id && info.item_type == b"zmlp"
+                    });
+                    if is_zmlp && zmlp_extents.is_none() {
+                        zmlp_extents = Some(Self::get_item_extents(&meta, target_id)?);
+                    }
+                }
 
                 if inputs.len() >= 2 {
                     let base_item_id = inputs[0].0;
@@ -1812,15 +1843,15 @@ impl<'data> AvifParser<'data> {
                             }
                         });
 
-                        (Some(metadata), Some(gmap_extents), alt_color)
+                        (Some(metadata), Some(gmap_extents), alt_color, zmlp_extents)
                     } else {
-                        (None, None, None)
+                        (None, None, None, zmlp_extents)
                     }
                 } else {
-                    (None, None, None)
+                    (None, None, None, zmlp_extents)
                 }
             } else {
-                (None, None, None)
+                (None, None, None, None)
             }
         };
 
@@ -1894,6 +1925,7 @@ impl<'data> AvifParser<'data> {
             gain_map_metadata,
             gain_map,
             gain_map_color_info,
+            gain_map_mlp_bake,
             depth_item,
             depth_width,
             depth_height,
@@ -2384,6 +2416,26 @@ impl<'data> AvifParser<'data> {
     /// Gain map image data (AV1-encoded), if present.
     pub fn gain_map_data(&self) -> Option<Result<Cow<'_, [u8]>>> {
         self.gain_map.as_ref().map(|item| self.resolve_item(item))
+    }
+
+    /// Gain-MLP (Canham et al. 2025) bake bytes, if a `'zmlp'`
+    /// auxiliary item is linked from the `tmap` derived-image item.
+    ///
+    /// The bake is a ZNPR v3 MLP consumable by
+    /// `zentone::GainMapMlpDecoder` for per-pixel HDR reconstruction
+    /// — an alternative to the traditional pixel gain map exposed by
+    /// [`Self::gain_map_data`]. Both representations can coexist; a
+    /// caller that supports the MLP path picks it for higher quality,
+    /// the rest fall back to the av01 pixel gain map.
+    ///
+    /// **Experimental.** The `'zmlp'` item type is vendor-prefixed
+    /// and not part of any ratified spec — see
+    /// `zenavif-serialize::set_gain_map_mlp_bake` for the encoder
+    /// side. Don't rely on cross-implementation interop yet.
+    pub fn gain_map_mlp_bake(&self) -> Option<Result<Cow<'_, [u8]>>> {
+        self.gain_map_mlp_bake
+            .as_ref()
+            .map(|item| self.resolve_item(item))
     }
 
     /// Color information for the alternate (typically HDR) rendition.

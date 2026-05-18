@@ -2370,3 +2370,95 @@ fn parser_to_avif_data_has_depth() {
     assert_eq!(dm.width, parser_dm.width);
     assert_eq!(dm.height, parser_dm.height);
 }
+
+// ─── Gain-MLP ('zmlp') roundtrip — encoder + decoder ───────────────
+
+/// Minimal ISO 21496-1 tone-map payload — same layout as
+/// `zenavif_serialize::make_test_tmap_metadata`, replicated here so
+/// the test doesn't depend on a private helper.
+fn make_tmap_metadata() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(0u8); // version
+    buf.extend_from_slice(&0u16.to_be_bytes()); // minimum_version
+    buf.extend_from_slice(&0u16.to_be_bytes()); // writer_version
+    // flags: bit 7 = is_multichannel (off), bit 6 = use_base_colour_space (on)
+    buf.push(1u8 << 6);
+    // base_hdr_headroom = 0/1
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    // alternate_hdr_headroom = 1/1
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    // Single-channel block: gain_map_min, gain_map_max, gamma,
+    // base_offset, alternate_offset — each (i32, u32) num/den pair.
+    buf.extend_from_slice(&0i32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1i32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&0i32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&0i32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf
+}
+
+#[test]
+fn gain_map_mlp_bake_roundtrips_through_muxer_and_parser() {
+    // Mint an AVIF that carries a Gain-MLP bake alongside the
+    // traditional av01 gain map. Parse it back; assert the bake
+    // bytes come out byte-identical and the traditional path
+    // still works unchanged.
+    let primary_data = b"primary_av1_xyz";
+    let gain_map_data = b"av01_gain_map_xyz";
+    let mut mlp_bake = Vec::with_capacity(256);
+    mlp_bake.extend_from_slice(b"ZMLP_BAKE_SENTINEL");
+    for i in 0..200u8 {
+        mlp_bake.push(i.wrapping_mul(37).wrapping_add(0x5A));
+    }
+    let metadata = make_tmap_metadata();
+
+    let avif_bytes = zenavif_serialize::Aviffy::new()
+        .set_gain_map(gain_map_data.to_vec(), 4, 4, 8, metadata)
+        .set_gain_map_mlp_bake(mlp_bake.clone())
+        .to_vec(primary_data, None, 10, 20, 8);
+
+    let parser =
+        zenavif_parse::AvifParser::from_bytes(&avif_bytes).expect("parse roundtrip AVIF");
+
+    // Traditional gain map path: unchanged.
+    let gm_data = parser
+        .gain_map_data()
+        .expect("gain_map_data present")
+        .expect("resolve");
+    assert_eq!(gm_data.as_ref(), &gain_map_data[..]);
+    let gm_meta = parser.gain_map_metadata().expect("gain_map_metadata present");
+    assert!(!gm_meta.is_multichannel);
+
+    // New 'zmlp' path: bake bytes come out byte-identical.
+    let bake_data = parser
+        .gain_map_mlp_bake()
+        .expect("gain_map_mlp_bake present")
+        .expect("resolve");
+    assert_eq!(bake_data.as_ref(), &mlp_bake[..]);
+}
+
+#[test]
+fn gain_map_mlp_bake_absent_when_not_attached() {
+    // Traditional gain-map AVIF without a Gain-MLP bake — accessor
+    // must return None.
+    let primary_data = b"primary_only";
+    let gain_map_data = b"av01_only";
+    let metadata = make_tmap_metadata();
+    let avif_bytes = zenavif_serialize::Aviffy::new()
+        .set_gain_map(gain_map_data.to_vec(), 4, 4, 8, metadata)
+        .to_vec(primary_data, None, 10, 20, 8);
+    let parser =
+        zenavif_parse::AvifParser::from_bytes(&avif_bytes).expect("parse non-MLP AVIF");
+    assert!(parser.gain_map_data().is_some());
+    assert!(
+        parser.gain_map_mlp_bake().is_none(),
+        "no zmlp bake expected for traditional gain-map AVIF"
+    );
+}

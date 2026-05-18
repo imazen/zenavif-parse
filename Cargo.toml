@@ -35,6 +35,10 @@ zencodec = { version = "0.1.13", default-features = false }
 [dev-dependencies]
 env_logger = "0.11.10"
 walkdir = "2.4.0"
+# Used by the gain_map_mlp_bake roundtrip test to mint AVIFs that
+# embed a `'zmlp'` bake. Path dep for now; flips to a published
+# version once `zenavif-serialize#2` lands.
+zenavif-serialize = { path = "../zenavif-serialize--gainmlp" }
 
 [features]
 eager = []
